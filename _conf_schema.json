@@ -1,0 +1,24 @@
+{
+  "api_url": {
+    "description": "授权兑换 API 地址",
+    "type": "string",
+    "default": "http://69.165.67.145:5963/exchange",
+    "hint": "POST /exchange",
+    "obvious_hint": true
+  },
+  "timeout_sec": {
+    "description": "请求超时（秒）",
+    "type": "float",
+    "default": 12
+  },
+  "max_days": {
+    "description": "允许的最大授权天数",
+    "type": "int",
+    "default": 3650
+  },
+  "allow_plain_trigger": {
+    "description": "是否允许纯文本“授权”触发（不带斜杠）",
+    "type": "bool",
+    "default": true
+  }
+}
