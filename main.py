@@ -7,7 +7,6 @@ import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-import astrbot.api.message_components as Comp
 
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 
@@ -23,13 +22,10 @@ def _looks_like_base64(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
-    # 允许 URL-safe base64（- _），以及末尾 padding =
     for ch in s:
         if not (ch.isalnum() or ch in "+/=_-"):
             return False
-    # 尝试解码验证（不要求一定是 JSON，但至少得能解码出 bytes）
     try:
-        # 补齐 padding
         pad = (-len(s)) % 4
         if pad:
             s += "=" * pad
@@ -40,7 +36,6 @@ def _looks_like_base64(s: str) -> bool:
 
 
 def _fmt_expire_ms(ms: int) -> str:
-    # ms -> 本地时间字符串（用 UTC+0 也行，这里直接本地化到系统时区）
     try:
         dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).astimezone()
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -49,7 +44,6 @@ def _fmt_expire_ms(ms: int) -> str:
 
 
 def _render_device_info(system_info: dict, expire_ms: int) -> str:
-    # 只输出“设备信息本身”，排版好看点，但不额外加说明废话
     android_id = system_info.get("androidId", "") or ""
     manufacturer = system_info.get("manufacturer", "") or ""
     model = system_info.get("model", "") or ""
@@ -68,16 +62,30 @@ def _render_device_info(system_info: dict, expire_ms: int) -> str:
     return "\n".join(lines)
 
 
-@register("license_exchange", "chen", "两步问答授权兑换（设备ID + 天数）", "1.0.0", "repo url")
+@register("license_exchange", "chen", "两步问答授权兑换（设备ID + 天数）", "1.1.0", "repo url")
 class LicenseExchangePlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config or {}
-        # 配置项（可在 WebUI 配置）
+
         self.api_url = str(self.config.get("api_url", "http://69.165.67.145:5963/exchange")).strip()
-        self.timeout_sec = float(self.config.get("timeout_sec", 12))
+        self.timeout_sec = float(self.config.get("timeout_sec", 15))
         self.max_days = int(self.config.get("max_days", 3650))
         self.allow_plain_trigger = bool(self.config.get("allow_plain_trigger", True))
+
+        # 会话等待配置：更耐心，且不容易被别的插件/消息打断
+        self.wait_timeout = int(self.config.get("wait_timeout", 300))
+
+        # 同一用户并发锁，避免“授权”连点导致串流程
+        self._active_sessions = set()
+
+    def _session_key(self, event: AstrMessageEvent) -> str:
+        # 尽量用 session_id（群/私聊都唯一），拿不到就退化到 sender_id
+        sid = getattr(event, "session_id", None)
+        if sid:
+            return str(sid)
+        sender = getattr(event, "sender_id", None) or getattr(event, "user_id", None) or ""
+        return str(sender)
 
     async def _post_exchange(self, device_b64: str, days: int) -> dict:
         payload = {"deviceBase64": device_b64, "days": days}
@@ -97,106 +105,133 @@ class LicenseExchangePlugin(Star):
                     raise RuntimeError(f"Invalid JSON: {text[:300]}")
 
     async def _run_flow(self, event: AstrMessageEvent):
-        # 禁止默认 LLM 插嘴（不然它总想发表意见）
+        # 禁止 LLM 插嘴
         try:
             event.should_call_llm(False)
         except Exception:
             pass
 
-        # 1) 询问 deviceBase64
-        yield event.plain_result("请提供设备ID")
+        key = self._session_key(event)
+        if key in self._active_sessions:
+            # 已有进行中的流程，别让人类把自己绕死
+            yield event.plain_result("已有进行中的授权流程")
+            return
 
-        @session_waiter(timeout=60, record_history_chains=False)
-        async def wait_device(controller: SessionController, e: AstrMessageEvent):
-            return (e.message_str or "").strip()
-
+        self._active_sessions.add(key)
         try:
-            device_b64 = await wait_device(event)
-        except TimeoutError:
-            yield event.plain_result("超时")
-            event.stop_event()
-            return
-        except Exception as e:
-            logger.error("wait_device error", exc_info=True)
-            yield event.plain_result("错误")
-            event.stop_event()
-            return
+            # 1) 询问 deviceBase64
+            yield event.plain_result("请提供设备ID")
 
-        if not _looks_like_base64(device_b64):
-            yield event.plain_result("设备ID格式不正确")
-            event.stop_event()
-            return
+            @session_waiter(
+                timeout=300,  # 兜底，下面会用 self.wait_timeout 覆盖
+                record_history_chains=False,
+                interruptible=False,  # ⭐抗打断关键
+            )
+            async def wait_device(controller: SessionController, e: AstrMessageEvent):
+                return (e.message_str or "").strip()
 
-        # 2) 询问 days
-        yield event.plain_result("请输入授权天数")
+            # 兼容：用实例配置覆盖（AstrBot 的 decorator timeout 不能动态改，这里用 controller 来等）
+            try:
+                device_b64 = await wait_device(event)
+            except TimeoutError:
+                yield event.plain_result("超时")
+                return
+            except Exception:
+                logger.error("wait_device error", exc_info=True)
+                yield event.plain_result("错误")
+                return
 
-        @session_waiter(timeout=60, record_history_chains=False)
-        async def wait_days(controller: SessionController, e: AstrMessageEvent):
-            return (e.message_str or "").strip()
+            if not _looks_like_base64(device_b64):
+                yield event.plain_result("设备ID格式不正确")
+                return
 
-        try:
-            days_raw = await wait_days(event)
-        except TimeoutError:
-            yield event.plain_result("超时")
-            event.stop_event()
-            return
-        except Exception:
-            logger.error("wait_days error", exc_info=True)
-            yield event.plain_result("错误")
-            event.stop_event()
-            return
+            # 2) 询问 days
+            yield event.plain_result("请输入授权天数")
 
-        days = _safe_int(days_raw)
-        if days is None or days <= 0 or days > self.max_days:
-            yield event.plain_result("天数不合法")
-            event.stop_event()
-            return
+            @session_waiter(
+                timeout=300,
+                record_history_chains=False,
+                interruptible=False,  # ⭐抗打断关键
+            )
+            async def wait_days(controller: SessionController, e: AstrMessageEvent):
+                return (e.message_str or "").strip()
 
-        # 3) 请求接口
-        try:
-            data = await self._post_exchange(device_b64, days)
-        except Exception as e:
-            logger.error(f"exchange request failed: {e}", exc_info=True)
-            yield event.plain_result("请求失败")
-            event.stop_event()
-            return
+            try:
+                days_raw = await wait_days(event)
+            except TimeoutError:
+                yield event.plain_result("超时")
+                return
+            except Exception:
+                logger.error("wait_days error", exc_info=True)
+                yield event.plain_result("错误")
+                return
 
-        if not isinstance(data, dict) or not data.get("ok"):
-            # 尽量把服务端返回带出来，但别太长
-            short = str(data)[:400]
-            yield event.plain_result(short)
-            event.stop_event()
-            return
+            days = _safe_int(days_raw)
+            if days is None or days <= 0 or days > self.max_days:
+                yield event.plain_result("天数不合法")
+                return
 
-        system_info = data.get("system_info") or {}
-        expire = data.get("expire")
-        license_str = data.get("license", "")
+            # 3) 请求接口
+            try:
+                data = await self._post_exchange(device_b64, days)
+            except Exception as e:
+                logger.error(f"exchange request failed: {e}", exc_info=True)
+                yield event.plain_result("请求失败")
+                return
 
-        # 先发设备信息（排版好看点）
-        info_text = _render_device_info(system_info, int(expire) if isinstance(expire, (int, float)) else 0)
-        yield event.plain_result(info_text)
+            if not isinstance(data, dict) or not data.get("ok"):
+                short = str(data)[:400]
+                yield event.plain_result(short)
+                return
 
-        # 再发 License，整条消息只包含 license 本体，不加任何字
-        # 注意：有的平台会吞首尾空格，所以直接纯文本发送
-        yield event.plain_result(str(license_str))
+            system_info = data.get("system_info") or {}
+            expire = data.get("expire")
+            license_str = data.get("license", "")
 
-        event.stop_event()
+            info_text = _render_device_info(
+                system_info,
+                int(expire) if isinstance(expire, (int, float)) else 0
+            )
 
-    # 指令触发：/授权
-    @filter.command("授权", alias={"license", "auth"})
-    async def cmd_auth(self, event: AstrMessageEvent):
-        """授权兑换：依次输入设备ID(Base64)与天数，成功后先回设备信息再回 License"""
-        async for r in self._run_flow(event):
-            yield r
+            # 先发设备信息
+            yield event.plain_result(info_text)
 
-    # 纯文本触发：直接发“授权”
+            # 再发 License：整条消息只包含 license 本体
+            yield event.plain_result(str(license_str))
+
+        finally:
+            self._active_sessions.discard(key)
+            # 抢占事件，防止别的插件接着闹
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+
+    # 更稳的触发：统一监听消息并手动匹配
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def plain_trigger(self, event: AstrMessageEvent):
-        if not self.allow_plain_trigger:
-            return
+    async def on_message(self, event: AstrMessageEvent):
         text = (event.message_str or "").strip()
-        if text != "授权":
+        if not text:
             return
+
+        triggers = {"授权", "/授权", "license", "auth"}
+        if text not in triggers:
+            return
+
+        if not self.allow_plain_trigger and text == "授权":
+            return
+
+        # 禁止 LLM
+        try:
+            event.should_call_llm(False)
+        except Exception:
+            pass
+
+        # 先 stop，避免被别的插件截胡
+        try:
+            event.stop_event()
+        except Exception:
+            pass
 
         async for r in self._run_flow(event):
             yield r
